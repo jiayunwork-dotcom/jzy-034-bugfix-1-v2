@@ -269,6 +269,91 @@ func TestHarmonicMeanDirectlySmallerThanArithmetic(t *testing.T) {
 	}
 }
 
+// TestPondedTopConductanceIsHarmonic locks the surface-to-top-cell
+// conductance formula: the ponded surface (K = Ks) and the top soil cell
+// (K = K0) are combined by the harmonic mean over the half-cell, so a dry
+// top layer chokes the boundary flux instead of being bypassed.
+func TestPondedTopConductanceIsHarmonic(t *testing.T) {
+	p := testMaterial()
+	g := testGrid(50)
+	s, err := NewSolverFromTheta(p, g, TopPondedHead, 0.02, BottomFreeDrainage,
+		repeat(0.15, g.NZ), DefaultOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, k0 := range []float64{0, 1e-9, 1e-6, p.Ks / 2, p.Ks} {
+		wantKf := 2.0 * p.Ks * k0 / (p.Ks + k0) // harmonic mean
+		want := 2.0 * wantKf / g.Dz
+		got := s.topConductance(k0)
+		if math.Abs(got-want) > 1e-12*math.Max(want, 1e-30) {
+			t.Fatalf("topConductance(K0=%g)=%g, want harmonic %g", k0, got, want)
+		}
+		// Harmonic never exceeds arithmetic, and a dry top cell (K0 orders
+		// of magnitude below Ks) must choke the conductance far below the
+		// arithmetic-mean value (ratio ~4*K0/Ks for K0 << Ks).
+		arith := 2.0 * 0.5 * (p.Ks + k0) / g.Dz
+		if k0 < p.Ks && !(got <= arith) {
+			t.Fatalf("topConductance(K0=%g)=%g above arithmetic %g", k0, got, arith)
+		}
+		if k0 < p.Ks/400 && !(got < arith/100) {
+			t.Fatalf("topConductance(K0=%g)=%g not far below arithmetic %g",
+				k0, got, arith)
+		}
+	}
+}
+
+// TestPondedTopFluxChokedByDryTopLayer reproduces the reported scenario:
+// the same 2 cm ponded head is applied to a very dry column (theta=0.10,
+// top-cell K orders of magnitude below Ks) and to a near-saturated one
+// (theta=0.38). The dry column's first-step top flux must be much SMALLER
+// than the wet column's, and must match the hand-computed harmonic-mean
+// estimate. (The arithmetic-mean bug inverted the ordering: dry 2.0e-4 vs
+// wet 9.7e-5 m/s, and overshot the estimate by a factor of ~400.)
+func TestPondedTopFluxChokedByDryTopLayer(t *testing.T) {
+	p := testMaterial()
+	g := testGrid(50)
+	const pond = 0.02
+	firstFlux := func(theta0 float64) float64 {
+		s, err := NewSolverFromTheta(p, g, TopPondedHead, pond,
+			BottomFreeDrainage, repeat(theta0, g.NZ), DefaultOptions())
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := s.Step(30)
+		if err != nil {
+			t.Fatalf("step theta0=%g: %v", theta0, err)
+		}
+		return res.TopFlux
+	}
+	qDry := firstFlux(0.10)
+	qWet := firstFlux(0.38)
+
+	if !(qDry > 0) || !(qWet > 0) {
+		t.Fatalf("expected positive infiltration, got dry=%g wet=%g", qDry, qWet)
+	}
+	if !(qDry < qWet) {
+		t.Fatalf("dry-column top flux %g must be below near-saturated %g",
+			qDry, qWet)
+	}
+	if ratio := qWet / qDry; ratio < 50 {
+		t.Fatalf("wet/dry first-step flux ratio %g too small; the dry top "+
+			"layer (K << Ks) must throttle the inflow", ratio)
+	}
+
+	// Hand check: q = (2*Kf/dz)*(hP - h0 + dz/2) with the harmonic mean
+	// Kf = 2*Ks*K0/(Ks+K0) evaluated at the initial state. The implicit
+	// step moves the state only slightly (the dry conductance is tiny), so
+	// the accepted step-end flux must agree to within 25%.
+	h0 := p.HeadFromWaterContent(0.10)
+	k0 := p.Conductivity(h0)
+	kf := 2.0 * p.Ks * k0 / (p.Ks + k0)
+	qEst := (2.0 * kf / g.Dz) * (pond - h0 + g.Dz/2.0)
+	if rel := math.Abs(qDry-qEst) / qEst; rel > 0.25 {
+		t.Fatalf("dry first-step flux %g deviates %.1f%% from harmonic-mean "+
+			"estimate %g", qDry, rel*100, qEst)
+	}
+}
+
 func TestSingleStepAndAdaptiveIntervalSameResult(t *testing.T) {
 	// When no internal substep is needed, StepAdaptive over an interval must
 	// give the bit-identical result of one Step of the same length.

@@ -250,8 +250,9 @@ type StepResult struct {
 // NZ+1 faces.
 //
 // gamma[f] for interior faces f=1..NZ-1: harmonic-mean K / dz.
-// gamma[0]: 0 — the ponded-top face is state dependent (harmonic mean of
-// surface Ks and cell-0 K over the half-cell), assembled in fluxAt.
+// gamma[0]: ponded-top face conductance (state dependent: harmonic mean of
+// the surface Ks and cell-0 K over the half-cell, see topConductance);
+// stays 0 for a zero-flux top.
 // gamma[NZ]: 0 (bottom flux is evaluated explicitly in fluxAt).
 func (s *Solver) faceConductances(kCell []float64) (gamma []float64) {
 	nz := s.Grid.NZ
@@ -270,11 +271,13 @@ func (s *Solver) faceConductances(kCell []float64) (gamma []float64) {
 
 // topConductance returns the surface-to-cell-0 conductance for a ponded
 // boundary: harmonic mean of the ponded-surface conductivity (Ks) and the
-// top-cell conductivity, across the half-cell distance dz/2.
+// top-cell conductivity, across the half-cell distance dz/2. The harmonic
+// mean is essential here: a dry top cell (K << Ks) must throttle the
+// infiltration, which an arithmetic mean would bypass (it is dominated by
+// Ks and would overstate the inflow by orders of magnitude).
 func (s *Solver) topConductance(k0 float64) float64 {
-	kSurf := s.Params.Ks
-	kHarm := 0.5 * (kSurf + k0)
-	return 2.0 * kHarm / s.Grid.Dz
+	kf := s.mean.mean(s.Params.Ks, k0)
+	return 2.0 * kf / s.Grid.Dz
 }
 
 // fluxAt evaluates all face fluxes qf[0..NZ] (positive downward) for the
@@ -442,12 +445,14 @@ func (s *Solver) Step(dt float64) (*StepResult, error) {
 		// top face
 		switch s.TopKind {
 		case TopPondedHead:
-			// q0 = K0*(2/dz)*(hP - h0 + dz/2), K0 harmonic(Ks, K(h0));
-			// -q0 enters row 0.
-			k0Harm := 0.5 * (s.Params.Ks + kCell[0])
+			// q0 = Kf*(2/dz)*(hP - h0 + dz/2) with Kf the (harmonic) mean
+			// of the ponded-surface Ks and K(h0); -q0 enters row 0. The
+			// derivative uses the same mean as topConductance so the
+			// Jacobian stays exactly consistent with the flux.
+			kf0 := s.mean.mean(s.Params.Ks, kCell[0])
 			factor0 := s.PondedH - hIt[0] + dz/2.0
-			dq0dn := 0.5*dkCell[0]*
-				(2.0/dz)*factor0 - k0Harm*2.0/dz
+			dq0dn := s.mean.dMeanDDown(s.Params.Ks, kCell[0])*dkCell[0]*
+				(2.0/dz)*factor0 - kf0*2.0/dz
 			diag[0] += -dq0dn
 		case TopZeroFlux:
 			// q0 = 0

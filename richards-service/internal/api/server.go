@@ -135,6 +135,7 @@ func (s *Server) constitutive(c *gin.Context) {
 			"richards_equation":    "dtheta/dt = d/dz [ K(h) * (dh/dz - 1) ], z positive downward",
 			"time_scheme":          "fully implicit backward Euler; full-Newton iteration (exact Jacobian, backtracking line search) per step; adaptive internal substepping",
 			"interblock_k":         "Kf = 2*K_i*K_{i+1}/(K_i+K_{i+1)} (harmonic mean, equal spacing)",
+			"ponded_top_k":         "Kf_top = 2*Ks*K_0/(Ks+K_0) over the half-cell dz/2 (harmonic mean of ponded surface and top cell)",
 		},
 		Constants: map[string]float64{
 			"m":                      -1, // locked, echoed symbolically below
@@ -150,6 +151,7 @@ func (s *Server) constitutive(c *gin.Context) {
 			"Mualem pore-connectivity exponent l is fixed at 0.5",
 			"units: m, s, K in m/s; flux positive downward",
 			"inter-cell conductivity uses the harmonic mean (never arithmetic)",
+			"ponded top boundary combines the surface Ks and the top-cell K by the harmonic mean, so a dry top layer throttles infiltration",
 			"bottom boundary is fixed per job: free_drainage or zero_flux",
 		},
 	}
