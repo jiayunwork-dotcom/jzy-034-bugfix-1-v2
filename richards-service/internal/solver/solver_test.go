@@ -269,6 +269,188 @@ func TestHarmonicMeanDirectlySmallerThanArithmetic(t *testing.T) {
 	}
 }
 
+// TestPondedTopConductanceIsHarmonic locks the surface-to-cell-0 conductance
+// of a ponded boundary to the harmonic mean of the ponded-surface Ks and the
+// top-cell conductivity. The service once implemented the documented harmonic
+// mean as an arithmetic mean here (while the interior faces were harmonic):
+// with a nearly dry top cell the arithmetic mean stays near Ks/2 and lets
+// infiltration bypass the low-conductivity surface layer.
+func TestPondedTopConductanceIsHarmonic(t *testing.T) {
+	p := testMaterial()
+	g := testGrid(50)
+	s, err := NewSolverFromTheta(p, g, TopPondedHead, 0.02, BottomFreeDrainage,
+		repeat(0.10, g.NZ), DefaultOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	k0 := p.ConductivitySe(thToSe(0.10, p)) // ≈ 2e-9, ~Ks/25000
+	ks := p.Ks
+	wantHarm := 2.0 * HarmonicMean.mean(ks, k0) / g.Dz
+	wantArith := 2.0 * ArithmeticMean.mean(ks, k0) / g.Dz
+	got := s.topConductance(k0)
+	if math.Abs(got-wantHarm) > 1e-15*wantHarm {
+		t.Fatalf("top conductance %v must be harmonic %v", got, wantHarm)
+	}
+	// Regression lock: the old arithmetic-mean implementation was ~1250x
+	// larger at this dryness; require the throttle to stay at that level.
+	if !(got < wantArith/500.0) {
+		t.Fatalf("dry top layer not throttling: harmonic %v arithmetic %v", got, wantArith)
+	}
+	// K0 << Ks limit: harmonic(Ks,K0) -> 2*K0, so the conductance tends to
+	// 4*K0/dz — the dry-cell half-distance bottleneck dominates completely.
+	if r := got / (4.0 * k0 / g.Dz); math.Abs(r-1.0) > 1e-3 {
+		t.Fatalf("dry-limit conductance %v should approach 4*K0/dz (ratio %v)", got, r)
+	}
+	// K0 = Ks limit: the two means coincide at 2*Ks/dz.
+	wantSat := 2.0 * ks / g.Dz
+	if got := s.topConductance(ks); math.Abs(got-wantSat) > 1e-12*wantSat {
+		t.Fatalf("equal-conductivity top conductance %v want %v", got, wantSat)
+	}
+	// A completely dry surface cell has zero conductance (no bypass).
+	if got := s.topConductance(0); got != 0 {
+		t.Fatalf("zero top-cell K should give zero conductance, got %v", got)
+	}
+}
+
+// TestPondedTopConductanceDerivative finite-difference checks the Newton
+// Jacobian term d(gamma0)/dK0 for the harmonic surface conductance.
+func TestPondedTopConductanceDerivative(t *testing.T) {
+	p := testMaterial()
+	g := testGrid(50)
+	s, err := NewSolverFromTheta(p, g, TopPondedHead, 0.02, BottomFreeDrainage,
+		repeat(0.10, g.NZ), DefaultOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, k0 := range []float64{1e-10, 2e-9, 2.2e-5, p.Ks} {
+		eps := 1e-6 * k0
+		fd := (s.topConductance(k0+eps) - s.topConductance(k0-eps)) / (2 * eps)
+		an := s.dTopConductanceDk0(k0)
+		if rel := math.Abs(fd-an) / math.Max(math.Abs(fd), 1e-30); rel > 1e-7 {
+			t.Fatalf("k0=%v analytic dConductance/dK0=%v finite-diff=%v rel=%v", k0, an, fd, rel)
+		}
+	}
+}
+
+// drySandColumn reproduces the reported scenario: a 1 m, 50-layer sand column
+// initially far below saturation under a 2 cm ponded head, free drainage at
+// the bottom. alpha=6, n=2, thetaR=0.05, thetaS=0.40, Ks=5e-5.
+func drySandColumn(t *testing.T, theta0 float64) *Solver {
+	t.Helper()
+	p := testMaterial()
+	g := testGrid(50)
+	s, err := NewSolverFromTheta(p, g, TopPondedHead, 0.02, BottomFreeDrainage,
+		repeat(theta0, g.NZ), DefaultOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+// TestDryTopLayerThrottlesFirstStepFlux locks the end-to-end first-step
+// behaviour of the ponded boundary. With theta0=0.10 the top-cell K is about
+// 2e-9 (Ks/25000): the first 30 s step must admit far less water than an
+// initially near-saturated column, and the flux must agree (to the small
+// implicit wetting over one step) with a hand harmonic-mean estimate. The
+// old arithmetic-mean surface conductance made the dry-column flux hundreds
+// of times too large — even larger than the near-saturated run.
+func TestDryTopLayerThrottlesFirstStepFlux(t *testing.T) {
+	dry, err := drySandColumn(t, 0.10).Step(30)
+	if err != nil {
+		t.Fatalf("dry step: %v", err)
+	}
+	wet, err := drySandColumn(t, 0.38).Step(30)
+	if err != nil {
+		t.Fatalf("wet step: %v", err)
+	}
+	if !(dry.TopFlux < wet.TopFlux/50.0) {
+		t.Fatalf("dry first-step flux %v must be throttled well below the "+
+			"near-saturated %v; a dry top layer cannot pass more water",
+			dry.TopFlux, wet.TopFlux)
+	}
+
+	// Independent hand calculation at the initial state:
+	// q0 = gamma0*(hP - h0 + dz/2), gamma0 the harmonic surface conductance.
+	p := testMaterial()
+	g := testGrid(50)
+	s0 := drySandColumn(t, 0.10)
+	h0 := s0.H[0]
+	k0i := p.Conductivity(h0)
+	qHand := (2.0 * HarmonicMean.mean(p.Ks, k0i) / g.Dz) *
+		(0.02 - h0 + g.Dz/2.0)
+	if r := dry.TopFlux / qHand; r < 0.5 || r > 2.0 {
+		t.Fatalf("first-step flux %v must match the harmonic-mean estimate %v"+
+			" (ratio %v, expected ~1 given slight implicit wetting)",
+			dry.TopFlux, qHand, r)
+	}
+}
+
+// TestSurfaceMeanSwitchChangesOnlyPondedFlux is the direct regression lock for
+// the bug class: flipping the boundary averaging from harmonic to arithmetic
+// must inflate the first ponded-boundary flux by orders of magnitude for a dry
+// column (the bug), while making essentially no difference for a near-saturated
+// column — exactly the asymmetry reported between the two runs.
+func TestSurfaceMeanSwitchChangesOnlyPondedFlux(t *testing.T) {
+	firstStepFlux := func(theta0 float64, m interblockMean) float64 {
+		s := drySandColumn(t, theta0)
+		s.mean = m
+		res, err := s.Step(30)
+		if err != nil {
+			t.Fatalf("step theta=%v mean=%v: %v", theta0, m, err)
+		}
+		return res.TopFlux
+	}
+	qDryH := firstStepFlux(0.10, HarmonicMean)
+	qDryA := firstStepFlux(0.10, ArithmeticMean)
+	qWetH := firstStepFlux(0.38, HarmonicMean)
+	qWetA := firstStepFlux(0.38, ArithmeticMean)
+	if qDryA < 100.0*qDryH {
+		t.Fatalf("arithmetic surface mean must inflate the dry-column first "+
+			"step by orders of magnitude over harmonic: %v vs %v", qDryA, qDryH)
+	}
+	if r := qWetA / qWetH; math.Abs(r-1.0) > 0.05 {
+		t.Fatalf("near-saturated column should be insensitive to the mean "+
+			"choice, ratio %v", r)
+	}
+}
+
+// TestDryPondedInfiltration30min locks the full 30-minute advance (50 layers,
+// 30 s reporting interval, adaptive substepping, exactly the reported job).
+// Infiltration into a nearly dry sand under only 2 cm of ponded water is
+// throttled by the unsaturated surface and stays in the few-millimetre /
+// shallow-front regime; the old arithmetic surface conductance admitted ~19x
+// more water and drove the front through 40% of the column.
+func TestDryPondedInfiltration30min(t *testing.T) {
+	s := drySandColumn(t, 0.10)
+	steps, err := s.MarchAdaptive(30, 60, DefaultAdaptiveConfig())
+	if err != nil {
+		t.Fatalf("march: %v", err)
+	}
+	last := steps[len(steps)-1]
+	front := frontDepth(last.ThetaAfter, 0.10, 0.40, 0.3, s.Grid)
+
+	// Independent upper bound on the surface supply over 1800 s: even if the
+	// top cell were instantly saturated, q <= Ks*(hP+dz)/ (dz/2) ... use the
+	// looser ponded driving head with Ks: q ~ Ks*(1 + 2*hP/dz) = 1.7e-4 m/s,
+	// i.e. 0.306 m. The unsaturated harmonic throttle keeps it orders below.
+	physicalCap := 0.02 // 20 mm of infiltrated depth for this dry-sand case
+	if !(s.CumTop > 0 && s.CumTop < physicalCap) {
+		t.Fatalf("30 min cumulative top inflow %v outside (0,%v)", s.CumTop, physicalCap)
+	}
+	if front > 0.08 {
+		t.Fatalf("wetting front %v m too deep for a dry column under 2 cm pond",
+			front)
+	}
+	// Every interval must still close exactly; the fix touches flux value,
+	// never the conservation bookkeeping.
+	for k, st := range steps {
+		if math.Abs(st.MassBalanceResidual) > 1e-9 {
+			t.Fatalf("interval %d closure residual %v", k, st.MassBalanceResidual)
+		}
+	}
+}
+
 func TestSingleStepAndAdaptiveIntervalSameResult(t *testing.T) {
 	// When no internal substep is needed, StepAdaptive over an interval must
 	// give the bit-identical result of one Step of the same length.

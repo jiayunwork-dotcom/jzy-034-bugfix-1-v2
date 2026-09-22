@@ -351,3 +351,88 @@ func TestInvalidTimeSpec(t *testing.T) {
 		t.Fatalf("expected non-divisible time error, got %v", err)
 	}
 }
+
+// dryPondedRequest builds the reported infiltration scenario: a 1 m, 50-layer
+// sand column initially far below saturation, a 2 cm ponded head on top and
+// free drainage at the bottom.
+func dryPondedRequest(theta0 float64) Request {
+	return Request{
+		Column:   Column{Thickness: 1.0, NZ: 50},
+		Material: Material{Alpha: 6.0, N: 2.0, ThetaR: 0.05, ThetaS: 0.40, Ks: 5e-5},
+		Initial:  Initial{Kind: "water_content", WaterContent: repeatSlice(theta0, 50)},
+		Boundary: Boundary{Top: solver.TopPondedHead, PondedHead: 0.02, Bottom: solver.BottomFreeDrainage},
+		Time:     TimeSpec{TotalTime: 1800, StepSize: 30},
+	}
+}
+
+// TestPondedDryColumnSurfaceThrottle runs the reported scenario through the
+// full service path (validation -> solver -> time series). The ponded-face
+// conductance must combine the surface Ks with the top cell's unsaturated K
+// harmonically, so a dry initial profile infiltrates far more slowly than a
+// near-saturated one. The buggy arithmetic surface mean made the dry run's
+// first-step top flux ~3e-4 m/s (even exceeding the near-saturated run); the
+// harmonic value is ~5e-7 m/s and the 30-minute intake stays only a few mm.
+func TestPondedDryColumnSurfaceThrottle(t *testing.T) {
+	dry, err := Run("dry", dryPondedRequest(0.10))
+	if err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	if len(dry.Steps) != 60 {
+		t.Fatalf("steps=%d want 60", len(dry.Steps))
+	}
+	qDryFirst := dry.Steps[0].TopFlux
+	qDryLast := dry.Steps[len(dry.Steps)-1].TopFlux
+
+	// Near-saturated comparison via the single-step API from the same start.
+	wr := dryPondedRequest(0.38)
+	stepReq := StepRequest{
+		Column:   wr.Column,
+		Material: wr.Material,
+		Initial:  wr.Initial,
+		Boundary: wr.Boundary,
+		StepSize: 30,
+	}
+	wet, err := RunStep("wet", stepReq)
+	if err != nil {
+		t.Fatalf("wet single step: %v", err)
+	}
+	qWet := wet.Step.TopFlux
+
+	// The dry top layer (K ~ 2e-9 vs Ks 5e-5) must throttle the first step
+	// to far below the near-saturated column.
+	if !(qDryFirst > 0 && qDryFirst < qWet/50.0) {
+		t.Fatalf("first-step dry top flux %v must be positive and far below "+
+			"near-saturated %v", qDryFirst, qWet)
+	}
+	// Hard ceiling for this configuration: 1e-5 m/s. The buggy value was 3e-4.
+	if qDryFirst > 1e-5 {
+		t.Fatalf("first-step dry top flux %v exceeds harmonic-surface ceiling",
+			qDryFirst)
+	}
+	// Total 30-minute intake for the dry sand stays in the few-millimetre
+	// regime (bug: ~0.126 m), and conservation closes exactly.
+	if !(dry.CumTopFluxM > 0 && dry.CumTopFluxM < 0.02) {
+		t.Fatalf("30 min cumulative intake %v outside expected regime",
+			dry.CumTopFluxM)
+	}
+	if math.Abs(dry.TotalMassResidualM) > 1e-9 {
+		t.Fatalf("total closure residual %v", dry.TotalMassResidualM)
+	}
+	// Flux grows as the surface wets but the front stays in the upper column.
+	if qDryLast <= qDryFirst {
+		t.Fatalf("top flux should rise as the surface wets: first %v last %v",
+			qDryFirst, qDryLast)
+	}
+	front := func(st StepOutput) float64 {
+		d := -1.0
+		for _, l := range st.Layers {
+			if l.WaterContent > 0.10+0.3*(0.40-0.10) {
+				d = l.DepthM
+			}
+		}
+		return d
+	}
+	if f := front(dry.Steps[len(dry.Steps)-1]); f > 0.08 {
+		t.Fatalf("wetting front %v m unrealistically deep after 30 min", f)
+	}
+}
